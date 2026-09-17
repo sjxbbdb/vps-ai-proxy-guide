@@ -1,0 +1,99 @@
+# ============================================================
+#  Clash Verge Rev / Mihomo 配置模板
+#  用法：Clash Verge → 订阅 → 新建 → Local → 选择本文件
+#
+#  ⚠️ 替换以下占位符后再使用：
+#     YOUR_VPS_IP        - 你的 VPS 公网 IP
+#     YOUR_HY2_PASSWORD  - deploy-singbox.sh 生成的 Hysteria2 密码
+#     YOUR_UUID          - 生成的 VLESS UUID
+#     YOUR_REALITY_PUBKEY- 生成的 Reality 公钥
+#     YOUR_SHORT_ID      - 生成的 ShortId
+# ============================================================
+
+mixed-port: 7890
+allow-lan: true          # 允许 WSL 通过局域网访问（WSL 必需）
+bind-address: '*'
+mode: rule               # ⚠️ 必须用 rule，不要用 global（见踩坑手册 #13）
+log-level: warning
+ipv6: false
+unified-delay: true
+tcp-concurrent: true
+find-process-mode: 'off'
+global-client-fingerprint: chrome
+
+# ------------------------------------------------------------
+# DNS 配置 —— 这一段直接决定延迟，务必按此配置
+#
+# 核心认知：fake-ip 模式下，客户端拿到假 IP（198.18.x.x），
+# 真实域名通过协议传给代理服务器，由境外服务器解析。
+# 所以本地 DNS 用什么【不影响】国外站点的解析结果，只影响解析速度。
+# 用国内 DNS 是最快的选择。
+# ------------------------------------------------------------
+dns:
+  enable: true
+  ipv6: false
+  listen: 0.0.0.0:1053
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - '*.lan'
+    - '*.local'
+    - 'localhost.ptlogin2.qq.com'
+  # DNS 查询本身也遵守分流规则
+  respect-rules: true
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  # ✅ 全部用国内 DNS（快、无污染）
+  # ❌ 不要写 1.1.1.1 / 8.8.8.8 —— 国内直连不稳定，会卡数秒（见踩坑手册 #8）
+  nameserver:
+    - https://223.5.5.5/dns-query        # 阿里 DNS
+    - https://119.29.29.29/dns-query     # 腾讯 DNS
+  # 代理服务器域名解析走国内（避免死循环）
+  proxy-server-nameserver:
+    - https://223.5.5.5/dns-query
+
+proxies:
+  # ---------- Hysteria2（速度优先）----------
+  - name: "VPS-HY2"
+    type: hysteria2
+    server: YOUR_VPS_IP
+    port: 8443
+    password: "YOUR_HY2_PASSWORD"
+    sni: www.bing.com
+    alpn:
+      - h3
+    skip-cert-verify: true    # 服务端用自签证书，HY2 自带加密层，可跳过校验
+    up: "50 Mbps"
+    down: "200 Mbps"
+
+  # ---------- VLESS + Reality（隐蔽优先）----------
+  - name: "VPS-Reality"
+    type: vless
+    server: YOUR_VPS_IP
+    port: 443
+    uuid: YOUR_UUID
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: www.microsoft.com     # 必须与服务端 REALITY_SERVERNAME 一致
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: YOUR_REALITY_PUBKEY
+      short-id: "YOUR_SHORT_ID"
+
+proxy-groups:
+  # fallback：HY2 优先，不通自动切 Reality
+  - name: "PROXY"
+    type: fallback
+    proxies:
+      - "VPS-HY2"
+      - "VPS-Reality"
+    url: "http://www.gstatic.com/generate_204"
+    interval: 300
+
+rules:
+  # 国内直连，其余走代理
+  - GEOIP,CN,DIRECT
+  - MATCH,PROXY
