@@ -1,21 +1,35 @@
-# 自建 VPS 访问海外大模型 · 完整实战指南
+# VPS 自建代理节点实战指南
 
-> 从选商家到稳定运行，包含 **13 个真实踩坑** 与源码级排查过程。
-> 面向：需要用海外大模型（ChatGPT / Claude / Gemini / Codex）**工作**的人。
-> 预算参考：**≈¥40/月**（$32/季）。
+> 从选型、部署到性能调优的完整工程实践。
+> 基于 **sing-box 1.14** 实现 Hysteria2 + VLESS-Reality 双协议，含 13 个真实故障的定位与修复过程。
 
 ---
 
-## 这份指南和别的教程有什么不同
+## 关于本指南
 
-网上大多数教程只教你"怎么装"。这份指南额外记录了两样东西：
+现有教程大多止步于"命令能跑通"。本指南补充两个通常缺失的部分：
 
-| | 内容 |
-|---|---|
-| **① 真实踩坑** | 13 个问题，每个都有**现象 → 根因 → 定位方法 → 修复**。其中 3 个是会在你服务器上直接报错的配置陷阱，2 个是官方文档都没写清的坑 |
-| **② 量化验证** | 所有结论都有实测数据。比如"代理延迟 4878ms → 197ms"这种 24 倍差距，是怎么通过一个 DNS 配置改出来的 |
+**故障工程**
+13 个实际遇到的问题，每个按 `现象 → 根因 → 定位方法 → 修复 → 验证` 组织。
+其中 3 个是配置语法完全正确、`check` 通过但运行时 FATAL 的陷阱；2 个涉及官方文档未明确说明的行为。
 
-**核心结论先行**：自建 VPS 的价值是 **独享 + 固定 + 少切换** 的 IP，而**不是**"变成住宅 IP"。理解这一点，能帮你避免 80% 的无效投入。
+**量化验证**
+所有性能结论均附实测数据与复现方法。例如本地 DNS 策略调整带来的延迟差异：
+
+| DNS 策略 | 实测平均延迟 |
+|---------|-------------|
+| `nameserver` 使用 1.1.1.1（经代理） | 860 ms |
+| `nameserver` 使用国内 DNS + fake-ip | **189 ms** |
+
+差异来源不是网络质量，而是解析路径。
+
+---
+
+## 核心结论
+
+**自建节点的价值在于「独享 + 固定 + 可控」，而非 IP 类型本身。**
+
+对目标服务的风控体系而言，一个长期稳定、不与他人共享、地理位置一致的出口，其可信度高于频繁切换的共享 IP。理解这一点可以避免绝大部分无效投入——包括为追求"住宅 IP"标签而支付数倍成本。
 
 ---
 
@@ -23,158 +37,182 @@
 
 | 文档 | 内容 |
 |------|------|
-| [docs/01-采购指南.md](docs/01-采购指南.md) | 商家筛选标准、线路选择逻辑、候选池对比、买前必查清单 |
-| [docs/02-部署指南.md](docs/02-部署指南.md) | VPS 端部署、客户端配置、WSL 打通 |
-| [docs/03-验证清单.md](docs/03-验证清单.md) | 六阶段可勾选验证清单 |
-| [docs/04-踩坑与排查手册.md](docs/04-踩坑与排查手册.md) | **13 个坑的完整排查过程**（技术含量最高） |
-| [docs/05-性能与安全审计.md](docs/05-性能与安全审计.md) | 资源占用、流量归因、异常排查方法 |
-| [docs/06-常见问题.md](docs/06-常见问题.md) | FAQ |
-| [scripts/deploy-singbox.sh](scripts/deploy-singbox.sh) | **一键部署脚本**（已在 Ubuntu 22.04 实测通过） |
-| [configs/](configs/) | 脱敏的客户端配置模板 |
+| [01 · 选型与采购](docs/01-选型与采购.md) | 线路分类（CN2 GIA / AS9929 / CMIN2）、机房取舍、商家对比、验真方法 |
+| [02 · 部署与客户端](docs/02-部署与客户端.md) | 服务端部署、双协议配置、客户端接入、WSL / 局域网打通 |
+| [03 · 验证清单](docs/03-验证清单.md) | 六阶段验证流程与判定标准 |
+| [04 · 故障排查手册](docs/04-故障排查手册.md) | **13 个真实故障的完整排查过程** |
+| [05 · 性能与安全审计](docs/05-性能与安全审计.md) | 资源基线、流量归因、DNS/WebRTC 泄露检测 |
+| [06 · 常见问题](docs/06-常见问题.md) | FAQ |
+| [scripts/deploy-singbox.sh](scripts/deploy-singbox.sh) | 一键部署脚本（Ubuntu 22.04 实测通过） |
+| [configs/](configs/) | 客户端配置模板 |
 
 ---
 
 ## 快速开始
 
-### 前置条件
+### 环境要求
 
-- 一台海外 VPS（Ubuntu 22.04 / 24.04，root 权限）
-- 本地：Clash Verge Rev（图形化，推荐）或 sing-box 客户端
-- **不需要**：域名、SSL 证书、备案
+| 项目 | 要求 |
+|------|------|
+| 服务端 | 海外 VPS，Ubuntu 22.04 / 24.04，root 权限 |
+| 客户端 | Clash Verge Rev（推荐）或 sing-box |
+| 域名 / 证书 | **不需要** |
+| 备案 | **不需要** |
 
-### 三步走
+Reality 复用外部站点的 TLS 特征，Hysteria2 使用自签证书（协议自带加密层），因此无需域名与证书配置。
+
+### 部署
 
 ```bash
-# ① 上传脚本
 scp scripts/deploy-singbox.sh root@YOUR_VPS_IP:/root/
-
-# ② 登录并执行
 ssh root@YOUR_VPS_IP
 sudo bash /root/deploy-singbox.sh
-
-# ③ 下载自动生成的客户端配置
-scp -r root@YOUR_VPS_IP:/root/client-configs ./
 ```
 
-脚本会自动完成：
+脚本执行流程：
 
 ```
-系统检查 → 开启 BBR → 网络调优 → 安装 sing-box（官方源）
-→ 生成 UUID / Reality 密钥 / 自签证书
-→ 写入双协议配置（Hysteria2 + VLESS-Reality）
-→ sing-box check 校验配置  ← 校验不过不会启动
-→ 配置 ufw 防火墙 + fail2ban
-→ 设置每 20 天自动更新
-→ 输出客户端配置到 /root/client-configs/
+系统检查与依赖安装
+  → BBR + 网络参数调优
+  → 安装 sing-box（官方源）
+  → 生成 UUID / Reality x25519 密钥 / 自签证书
+  → 写入双协议配置
+  → sing-box check 校验（不通过则中止）
+  → ufw 防火墙 + fail2ban
+  → 每 20 天自动更新任务
+  → 输出客户端配置到 /root/client-configs/
 ```
 
-### 部署完成后
-
-按 [docs/03-验证清单.md](docs/03-验证清单.md) 逐项验证。**关键的三条**：
+### 部署后验证
 
 ```bash
-systemctl is-active sing-box          # 应为 active
-ss -tulnp | grep sing-box             # 应看到 443/tcp 和 8443/udp
-curl -s https://ipinfo.io/json        # 出口应为你的 VPS IP
+systemctl is-active sing-box          # active
+systemctl is-enabled sing-box         # enabled
+ss -tulnp | grep sing-box             # 443/tcp + 8443/udp
+curl -s https://ipinfo.io/json        # 出口 IP 应为 VPS IP
 ```
 
----
-
-## 方案选型
-
-### 协议：为什么是 Hysteria2 + VLESS-Reality 双栈
-
-| 协议 | 优势 | 适用场景 |
-|------|------|---------|
-| **Hysteria2** | 基于 QUIC + 内置 BBR，弱网/高丢包下速度最好 | 家宽日常、大流量 |
-| **VLESS-Reality** | 借用真实大站 TLS 握手特征，抗主动探测 | 移动网络、敏感时期 |
-
-两者互补：客户端配置 `fallback` 策略组，HY2 不通自动切 Reality。
-
-### 为什么不用 WireGuard / Trojan
-
-- **WireGuard**：特征极其明显（固定 UDP 端口 + 握手包特征），容易被识别
-- **Trojan**：技术上没失效，但依赖域名+证书，且抗主动探测能力弱于 Reality
-- **Reality 的核心优势**：**不需要域名、不需要证书**，直接借用 `www.microsoft.com` 这类大站的 TLS 特征
-
-### 机房：延迟 vs 风控的取舍
-
-| 机房 | 到国内延迟 | AI 风控友好度 |
-|------|-----------|--------------|
-| 香港 | 30–50ms | ⚠️ 部分 IP 段不友好 |
-| 东京/大阪 | 50–90ms | ⚠️ 尚可 |
-| **洛杉矶（美西）** | **150–220ms** | ✅ **最友好** |
-
-**要"美国原生 IP"就选洛杉矶**——它是离中国最近的美国机房，是"美国 IP + 尽可能低延迟"的唯一解。
+完整验证流程见 [03 · 验证清单](docs/03-验证清单.md)。
 
 ---
 
-## 13 个坑速览
+## 技术方案
 
-| # | 问题 | 根因 | 章节 |
-|---|------|------|------|
-| 1 | SSH 密钥认证一直 `Permission denied` | PowerShell 把空口令 `""` 当字面量，密钥被 bcrypt 加密 | [04](docs/04-踩坑与排查手册.md#1-ssh-密钥认证失败) |
-| 2 | `sing-box check` 通过但启动 FATAL | 1.14 **移除**了旧版 DNS server 格式 | [04](docs/04-踩坑与排查手册.md#2-dns-server-格式在-114-被移除) |
-| 3 | 同上 | 1.14 **强制要求** `route.default_domain_resolver` | [04](docs/04-踩坑与排查手册.md#3-缺少-default_domain_resolver) |
-| 4 | `detour to an empty direct outbound` | `"detour": "direct"` 指向内置空 direct | [04](docs/04-踩坑与排查手册.md#4-detour-指向空-direct) |
-| 5 | WSL 连不上 Windows 代理 | Windows 防火墙有**自动生成的 Block 规则** | [04](docs/04-踩坑与排查手册.md#5-wsl-连不上-windows-代理) |
-| 6 | PS 脚本报 `MissingEndCurlyBrace` | PS 5.1 按 ANSI 读 UTF-8 无 BOM 文件 | [04](docs/04-踩坑与排查手册.md#6-powershell-脚本编码陷阱) |
-| 7 | Clash 端口改了不生效 | **应用级设置优先于 profile** | [04](docs/04-踩坑与排查手册.md#7-clash-端口设置被覆盖) |
-| 8 | **代理延迟高达 4878ms** | DNS 配了 `1.1.1.1`，国内直连不稳定 | [04](docs/04-踩坑与排查手册.md#8-延迟-4878ms-到-197ms) |
-| 9 | 开机自启"设置是假的" | `enable_auto_launch: true` 不写注册表 | [04](docs/04-踩坑与排查手册.md#9-开机自启未生效) |
-| 10 | Codex 桌面端「重新连接 1/5」 | Rust 后端默认不读系统代理 | [04](docs/04-踩坑与排查手册.md#10-codex-桌面端连不上) |
-| 11 | Node CLI 不读 `HTTPS_PROXY` | Node 需 `NODE_USE_ENV_PROXY=1` | [04](docs/04-踩坑与排查手册.md#11-node-不读代理环境变量) |
-| 12 | 误判「Cloudflare 封了 IP」 | 实际是缺 `originator` 请求头 | [04](docs/04-踩坑与排查手册.md#12-cloudflare-403-的真相) |
-| 13 | **VPS 流量约 100GB/天** | 全局模式让国内流量也绕道美国 | [04](docs/04-踩坑与排查手册.md#13-全局模式导致流量浪费) |
+### 协议选型
 
----
+采用双协议并行，客户端以 `url-test` 策略组自动选择：
 
-## 核心知识速查
+| 协议 | 传输层 | 优势 | 适用场景 |
+|------|--------|------|---------|
+| **Hysteria2** | QUIC / UDP 8443 | 内置 BBR，弱网与高丢包环境下吞吐最优 | 家庭宽带、大流量 |
+| **VLESS-Reality** | TCP 443 | 复用真实站点 TLS 握手特征，抗主动探测 | 移动网络、严格审查环境 |
 
-### Node 程序代理（最容易踩的坑）
+选择依据：
 
-```bash
-# Node.js 原生不读 HTTP_PROXY / HTTPS_PROXY
-# 必须设置这个（Node 24+）：
-export NODE_USE_ENV_PROXY=1
+- **不选 WireGuard** —— 固定 UDP 端口与握手特征明显，易被识别
+- **不选 Trojan** —— 依赖域名与证书，抗主动探测能力弱于 Reality
+- **Reality 的优势** —— 无需自有域名，直接借用 `www.microsoft.com` 等站点的 TLS 特征
+
+### 分流策略
+
+```
+GEOIP,CN,DIRECT     国内流量直连
+MATCH,PROXY         其余走代理
 ```
 
-受影响工具：`claude`、`codex`、以及任何 Node 写的 CLI。
+**必须使用规则（rule）模式。** 全局（global）模式下分流规则失效，国内流量将绕行境外节点——实测延迟从 236 ms 升至 1674 ms，且产生约 100 GB/天的额外流量消耗。
 
-### Clash 的 DNS 配置（决定延迟）
+### DNS 策略
 
 ```yaml
 dns:
-  enable: true
   enhanced-mode: fake-ip
   respect-rules: true
-  # ✅ 全部用国内 DNS —— fake-ip 模式下不影响国外访问
   nameserver:
-    - https://223.5.5.5/dns-query
+    - https://223.5.5.5/dns-query       # 国内 DNS
     - https://119.29.29.29/dns-query
-  # ❌ 不要在这里写 1.1.1.1 / 8.8.8.8（国内直连不稳定，会卡数秒）
 ```
 
-### 代理模式必须用 rule
+fake-ip 模式下客户端持有虚拟 IP，真实域名经协议传递至服务端解析。因此本地 DNS 仅影响解析速度，不改变境外站点的解析位置。将 `nameserver` 指向境外 DNS（即便标记 `#PROXY`）会使每次解析引入跨境往返，实测延迟由 189 ms 升至 860 ms。
+
+### 网络参数
+
+服务端脚本自动配置：
 
 ```
-rule 模式   : 国内直连 + 国外走代理   ← 正确
-global 模式 : 全部走代理（含国内）    ← 慢 + 浪费流量
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.core.rmem_max / wmem_max = 33554432
 ```
 
 ---
 
-## 实测性能数据
+## 实测数据
+
+部署环境：ZgoCloud 洛杉矶，AMD EPYC / 3 GB RAM，9929 + CMIN2 线路；客户端位于中国联通家宽。
 
 | 指标 | 数值 |
 |------|------|
-| 平均延迟（美西优化线路） | **193–197 ms** |
-| 连续 30 次请求失败率 | **0%** |
+| 出口延迟（15 次采样） | 最小 172 ms / 平均 **189 ms** / 最大 244 ms |
+| 持续请求失败率（30 次） | **0 %** |
 | 抖动 | 15.5 ms |
-| 代理栈内存占用 | 137 MB（占 31.4 GB 的 0.43%） |
-| 代理栈 CPU 占用 | ≈0.02% |
-| VPS sing-box 内存 | 83.9 MB |
-| VPS 系统负载 | 0.05 |
+| 国内站点延迟（直连验证） | 百度 192 ms / 淘宝 159 ms |
+| 代理栈内存占用（客户端） | 137 MB |
+| 代理栈 CPU 占用（客户端） | ≈ 0.02 % |
+| sing-box 内存占用（服务端） | 83.9 MB |
+| 服务端系统负载 | 0.05 |
+
+### 流量归因验证
+
+在规则模式下产生 20 次国内站点请求，观测服务端网卡增量：
+
+```
+接收增量：0.083 MB
+发送增量：0.039 MB
+合计：    0.121 MB
+```
+
+国内流量未经境外节点。
+
+---
+
+## 13 个故障索引
+
+| # | 现象 | 根因类别 |
+|---|------|---------|
+| 1 | SSH 密钥认证持续失败 | 密钥生成（口令编码） |
+| 2 | `check` 通过但启动 FATAL | 配置格式变更（1.14 移除旧 DNS 格式） |
+| 3 | `missing default_domain_resolver` | 配置格式变更（1.14 强制要求） |
+| 4 | `detour to an empty direct outbound` | 配置语义 |
+| 5 | 局域网/WSL 无法访问代理 | 主机防火墙策略 |
+| 6 | PowerShell 脚本解析错误 | 脚本文件编码 |
+| 7 | 修改配置不生效 | 多层级配置优先级 |
+| 8 | 代理延迟 4878 ms | DNS 解析路径 |
+| 9 | 开机自启未生效 | 自启机制未实际写入 |
+| 10 | 桌面客户端间歇断连 | 应用默认不读取系统代理 |
+| 11 | Node 程序不遵循代理环境变量 | 运行时行为 |
+| 12 | Cloudflare 403 挑战 | 请求头缺失（非 IP 信誉） |
+| 13 | 流量异常（约 100 GB/天） | 分流模式配置 |
+
+详细排查过程见 [04 · 故障排查手册](docs/04-故障排查手册.md)。
+
+---
+
+## 适用与不适用
+
+**适用**
+
+- 需要稳定、可控、独享的境外出口
+- 需要 DNS 与流量路径完全可控
+- 具备基础 Linux 运维能力，或愿意按文档操作
+
+**不适用**
+
+- 期望零配置、开箱即用（建议使用商业代理服务）
+- 需要住宅 IP 属性（需另择方案，成本显著更高）
+- 需要规避平台服务条款的场景
 
 ---
 
@@ -182,17 +220,9 @@ global 模式 : 全部走代理（含国内）    ← 慢 + 浪费流量
 
 | 限制 | 说明 |
 |------|------|
-| `chatgpt.com` 网页版可能 403 | Cloudflare 对非浏览器 TLS 指纹的挑战。**API 不受影响**（`api.openai.com` 返回 401 正常） |
-| Codex 桌面端需额外配置 | 见 [坑 10](docs/04-踩坑与排查手册.md#10-codex-桌面端连不上) |
-| 自建 ≠ 住宅 IP | 机房 IP 仍有被风控可能。真正的价值是**固定 + 独享 + 少切换** |
-| 需要自己维护 | 系统更新、IP 被封后换 IP、流量监控 |
-
----
-
-## 免责声明
-
-本项目仅供**技术学习与个人合规使用**。请确保你的使用场景符合当地法律法规。
-自建代理涉及服务器运维，请自行承担风险。作者不对使用本指南产生的任何后果负责。
+| 出口为数据中心 IP | 部分站点会触发人机验证。多数情况下可通过补齐标准客户端请求头解决，见故障 12 |
+| 需自行维护 | 系统更新、证书轮换、IP 被封后更换 |
+| 单点故障 | 建议保留备用出口 |
 
 ---
 
@@ -200,17 +230,16 @@ global 模式 : 全部走代理（含国内）    ← 慢 + 浪费流量
 
 | 内容 | 来源 |
 |------|------|
-| AI 出口选择策略、预算分档 | [VPSKnow 固定IP/住宅IP/ISP IP 指南](https://vpsknow.com/guides/ai-fixed-ip-residential-isp-guide) |
 | sing-box 官方文档 | [sing-box.sagernet.org](https://sing-box.sagernet.org/) |
-| Reality 技术说明 | [XTLS/Reality](https://github.com/XTLS/Reality) |
+| Reality 协议技术说明 | [XTLS/Reality](https://github.com/XTLS/Reality) |
 | Hysteria2 官方文档 | [v2.hysteria.network](https://v2.hysteria.network/) |
-| Codex 后端不读系统代理（源码级定位） | [cg689/codex-reconnect-fix](https://github.com/cg689/codex-reconnect-fix) |
-| 桌面端代理变量变空 | [openai/codex#37662](https://github.com/openai/codex/issues/37662) |
-| Cloudflare 403 challenge 分析 | [openai/codex#39324](https://github.com/openai/codex/issues/39324) |
-| `originator` 头绕过 CF 挑战 | [NousResearch/hermes-agent#6391](https://github.com/NousResearch/hermes-agent/pull/6391) |
-| CN2 GIA / AS9929 / CMIN2 线路对比 | [VPS Moon](https://www.vpsmoon.com/cn2-gia-hosting/cn2-gia-vps-recommendation) |
-| 自建 vs 机场实测对比 | [Sagasu 自建教程](https://www.sagasu.art/posts/complete-vpn-tutorial-for-beginners-optimal-version) |
-| VLESS + Reality 搭建 | [cholf5/random#38](https://github.com/cholf5/random/issues/38) |
+| 回国线路对比（CN2 GIA / AS9929 / CMIN2） | [VPS Moon](https://www.vpsmoon.com/cn2-gia-hosting/cn2-gia-vps-recommendation) |
+| 出口选择策略与预算分档 | [VPSKnow](https://vpsknow.com/guides/ai-fixed-ip-residential-isp-guide) |
+| VLESS + Reality 部署 | [cholf5/random#38](https://github.com/cholf5/random/issues/38) |
+| sing-box 双协议部署实践 | [Sagasu](https://www.sagasu.art/posts/complete-vpn-tutorial-for-beginners-optimal-version) |
+| Codex 客户端代理行为（源码级） | [cg689/codex-reconnect-fix](https://github.com/cg689/codex-reconnect-fix) |
+| 代理环境变量与客户端兼容性 | [openai/codex#37662](https://github.com/openai/codex/issues/37662) |
+| Cloudflare 挑战与请求头 | [NousResearch/hermes-agent#6391](https://github.com/NousResearch/hermes-agent/pull/6391) |
 
 ---
 
